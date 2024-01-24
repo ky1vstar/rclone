@@ -622,48 +622,56 @@ func (o *Object) Update(ctx context.Context, in io.Reader, src fs.ObjectInfo, op
 			getFirstStepResult.Data.Server,
 			obs.WithSecurityToken(getFirstStepResult.Data.SecurityToken),
 		)
-
 		if err != nil {
 			return fmt.Errorf("Failed to create OBS client: %w", err)
 		}
-
-		putObjectInput := &obs.CreateSignedUrlInput{}
-		putObjectInput.Method = obs.HttpMethodPut
-		putObjectInput.Bucket = getFirstStepResult.Data.Bucket
-		putObjectInput.Key = getFirstStepResult.Data.PoolPath
-		putObjectInput.Expires = 3600
-
-		// create a signed URL for uploading an object
-		putObjectOutput, err := obsClient.CreateSignedUrl(putObjectInput)
-		if err != nil {
-			return fmt.Errorf("Failed to create signed upload URL: %w", err)
-		}
-
-		// upload file using link from first step
-		var res *http.Response
+		defer obsClient.Close()
 
 		file := io.MultiReader(bytes.NewReader(first10mBytes), in)
 
-		opts := &rest.Opts{
-			Method:        "PUT",
-			RootURL:       putObjectOutput.SignedUrl,
-			Options:       options,
-			Body:          file,
-			ContentLength: &size,
+		// Initiate a multipart upload
+		inputInit := &obs.InitiateMultipartUploadInput{}
+		inputInit.Bucket = getFirstStepResult.Data.Bucket
+		inputInit.Key = getFirstStepResult.Data.PoolPath
+		outputInit, err := obsClient.InitiateMultipartUpload(inputInit)
+		if err != nil {
+			return fmt.Errorf("Failed to initiate a multipart upload: %w", err)
 		}
 
-		err = o.fs.pacer.CallNoRetry(func() (bool, error) {
-			res, err = o.fs.srv.Call(ctx, opts)
-			return o.fs.shouldRetry(ctx, res, err)
-		})
-
-		if err != nil {
-			return fmt.Errorf("update err in uploading file: %w", err)
+		// Upload parts
+		const partSize = 524_288_000
+		numberOfParts := int(1 + (size-1)/partSize)
+		parts := make([]obs.Part, numberOfParts)
+		remainingSize := size
+		for partNumber := 1; partNumber <= numberOfParts; partNumber++ {
+			fs.Debugf(o, "Uploading part %d/%d", partNumber, numberOfParts)
+			inputUploadPart := &obs.UploadPartInput{}
+			inputUploadPart.Bucket = getFirstStepResult.Data.Bucket
+			inputUploadPart.Key = getFirstStepResult.Data.PoolPath
+			inputUploadPart.UploadId = outputInit.UploadId
+			inputUploadPart.PartNumber = partNumber
+			inputUploadPart.Body = io.LimitReader(file, partSize)
+			inputUploadPart.PartSize = min(remainingSize, partSize)
+			var outputUploadPart, err = obsClient.UploadPart(inputUploadPart)
+			if err != nil {
+				return fmt.Errorf("Failed to upload a part: %w", err)
+			}
+			parts[partNumber-1] = obs.Part{
+				PartNumber: outputUploadPart.PartNumber,
+				ETag:       outputUploadPart.ETag,
+			}
+			remainingSize -= partSize
 		}
 
-		_, err = io.ReadAll(res.Body)
+		// Assemble parts
+		inputCompleteMultipart := &obs.CompleteMultipartUploadInput{}
+		inputCompleteMultipart.Bucket = getFirstStepResult.Data.Bucket
+		inputCompleteMultipart.Key = getFirstStepResult.Data.PoolPath
+		inputCompleteMultipart.UploadId = outputInit.UploadId
+		inputCompleteMultipart.Parts = parts
+		_, err = obsClient.CompleteMultipartUpload(inputCompleteMultipart)
 		if err != nil {
-			return fmt.Errorf("update err in reading response: %w", err)
+			return fmt.Errorf("Failed to complete a multipart upload: %w", err)
 		}
 
 	case 600:
@@ -694,32 +702,31 @@ func (o *Object) Update(ctx context.Context, in io.Reader, src fs.ObjectInfo, op
 		},
 	}
 
-	getSecondStepResult := getUploadURLResponse{}
+	getSecondStepResult := uploadFileRes{}
 	err = getUnmarshaledResponse(ctx, o.fs, opts, &getSecondStepResult)
 	if err != nil {
 		return fmt.Errorf("Update second step failed: %w", err)
 	}
 
-	// Try a few times to read the object after upload for eventual consistency
-	const maxTries = 10
-	var sleepTime = 100 * time.Millisecond
-	var entity *entity
-	for try := 1; try <= maxTries; try++ {
-		entity, err = getEntity(ctx, o.fs, leaf, dirID, o.fs.opt.Token)
-		if err == nil {
-			break
-		}
-		if err != fs.ErrorObjectNotFound {
-			return fmt.Errorf("Update failed to read object: %w", err)
-		}
-		fs.Debugf(o, "Trying to read object after upload: try again in %v (%d/%d)", sleepTime, try, maxTries)
-		time.Sleep(sleepTime)
-		sleepTime *= 2
+	// Try to read remote object
+	opts = &rest.Opts{
+		Method:  "GET",
+		RootURL: linkboxAPIURL,
+		Path:    "file/detail",
+		Options: options,
+		Parameters: url.Values{
+			"token":  {o.fs.opt.Token},
+			"itemId": {getSecondStepResult.Data.ItemID},
+		},
 	}
+
+	getFileDetailResult := fileDetailRes{}
+	err = getUnmarshaledResponse(ctx, o.fs, opts, &getFileDetailResult)
 	if err != nil {
-		return err
+		return fmt.Errorf("Update failed to read object: %w", err)
 	}
-	o.set(entity)
+
+	o.set(&getFileDetailResult.Data.ItemInfo)
 	return nil
 }
 
@@ -861,6 +868,20 @@ type getUploadURLResponse struct {
 	Data getUploadURLData `json:"data"`
 }
 
+type uploadFileRes struct {
+	response
+	Data struct {
+		ItemID string `json:"itemId"`
+	} `json:"data"`
+}
+
+type fileDetailRes struct {
+	response
+	Data struct {
+		ItemInfo entity `json:"itemInfo"`
+	} `json:"data"`
+}
+
 // Put in to the remote path with the modTime given of the given size
 //
 // When called from outside an Fs by rclone, src.Size() will always be >= 0.
@@ -911,6 +932,14 @@ func (f *Fs) shouldRetry(ctx context.Context, resp *http.Response, err error) (b
 		return false, err
 	}
 	return fserrors.ShouldRetry(err) || fserrors.ShouldRetryHTTP(resp, retryErrorCodes), err
+}
+
+// min returns the smallest of x, y
+func min(x, y int64) int64 {
+	if x < y {
+		return x
+	}
+	return y
 }
 
 // DirCacheFlush resets the directory cache - used in testing as an
