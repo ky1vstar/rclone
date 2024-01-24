@@ -639,7 +639,7 @@ func (o *Object) Update(ctx context.Context, in io.Reader, src fs.ObjectInfo, op
 		}
 
 		// Upload parts
-		const partSize = 524_288_000
+		const partSize = 52_428_800
 		numberOfParts := int(1 + (size-1)/partSize)
 		parts := make([]obs.Part, numberOfParts)
 		remainingSize := size
