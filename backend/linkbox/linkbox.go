@@ -24,6 +24,7 @@ import (
 	"strings"
 	"time"
 
+	obs "github.com/huaweicloud/huaweicloud-sdk-go-obs/obs"
 	"github.com/rclone/rclone/fs"
 	"github.com/rclone/rclone/fs/config/configmap"
 	"github.com/rclone/rclone/fs/config/configstruct"
@@ -40,7 +41,7 @@ const (
 	minSleep           = 200 * time.Millisecond
 	maxSleep           = 2 * time.Second
 	pacerBurst         = 1
-	linkboxAPIURL      = "https://www.linkbox.to/api/open/"
+	linkboxAPIURL      = "https://www.telebox.online/api/"
 	rootID             = "0" // ID of root directory
 )
 
@@ -244,7 +245,7 @@ OUTER:
 		opts := &rest.Opts{
 			Method:  "GET",
 			RootURL: linkboxAPIURL,
-			Path:    "file_search",
+			Path:    "file/my_file_list/web",
 			Parameters: url.Values{
 				"token":    {f.opt.Token},
 				"name":     {name},
@@ -332,7 +333,7 @@ func (f *Fs) CreateDir(ctx context.Context, dirID, leaf string) (newID string, e
 	opts := &rest.Opts{
 		Method:  "GET",
 		RootURL: linkboxAPIURL,
-		Path:    "folder_create",
+		Path:    "file/create_folder/web",
 		Parameters: url.Values{
 			"token":       {f.opt.Token},
 			"name":        {leaf},
@@ -478,7 +479,7 @@ func (f *Fs) purgeCheck(ctx context.Context, dir string, check bool) error {
 	opts := &rest.Opts{
 		Method:  "GET",
 		RootURL: linkboxAPIURL,
-		Path:    "folder_del",
+		Path:    "file/delete",
 		Parameters: url.Values{
 			"token":  {f.opt.Token},
 			"dirIds": {directoryID},
@@ -595,12 +596,13 @@ func (o *Object) Update(ctx context.Context, in io.Reader, src fs.ObjectInfo, op
 	opts := &rest.Opts{
 		Method:  "GET",
 		RootURL: linkboxAPIURL,
-		Path:    "get_upload_url",
+		Path:    "file/get_file_upload_session",
 		Options: options,
 		Parameters: url.Values{
-			"token":           {o.fs.opt.Token},
-			"fileMd5ofPre10m": {fmt.Sprintf("%x", md5.Sum(first10mBytes))},
-			"fileSize":        {itoa64(size)},
+			"token":      {o.fs.opt.Token},
+			"scene":      {"common"},
+			"vgroupType": {"md5_10m"},
+			"vgroup":     {fmt.Sprintf("%x_%d", md5.Sum(first10mBytes), size)},
 		},
 	}
 
@@ -614,6 +616,29 @@ func (o *Object) Update(ctx context.Context, in io.Reader, src fs.ObjectInfo, op
 
 	switch getFirstStepResult.Status {
 	case 1:
+		obsClient, err := obs.New(
+			getFirstStepResult.Data.AccessKey,
+			getFirstStepResult.Data.SecretAccessKey,
+			getFirstStepResult.Data.Server,
+			obs.WithSecurityToken(getFirstStepResult.Data.SecurityToken),
+		)
+
+		if err != nil {
+			return fmt.Errorf("Failed to create OBS client: %w", err)
+		}
+
+		putObjectInput := &obs.CreateSignedUrlInput{}
+		putObjectInput.Method = obs.HttpMethodPut
+		putObjectInput.Bucket = getFirstStepResult.Data.Bucket
+		putObjectInput.Key = getFirstStepResult.Data.PoolPath
+		putObjectInput.Expires = 3600
+
+		// create a signed URL for uploading an object
+		putObjectOutput, err := obsClient.CreateSignedUrl(putObjectInput)
+		if err != nil {
+			return fmt.Errorf("Failed to create signed upload URL: %w", err)
+		}
+
 		// upload file using link from first step
 		var res *http.Response
 
@@ -621,7 +646,7 @@ func (o *Object) Update(ctx context.Context, in io.Reader, src fs.ObjectInfo, op
 
 		opts := &rest.Opts{
 			Method:        "PUT",
-			RootURL:       getFirstStepResult.Data.SignURL,
+			RootURL:       putObjectOutput.SignedUrl,
 			Options:       options,
 			Body:          file,
 			ContentLength: &size,
@@ -657,14 +682,15 @@ func (o *Object) Update(ctx context.Context, in io.Reader, src fs.ObjectInfo, op
 	opts = &rest.Opts{
 		Method:  "GET",
 		RootURL: linkboxAPIURL,
-		Path:    "folder_upload_file",
+		Path:    "file/create_item",
 		Options: options,
 		Parameters: url.Values{
-			"token":           {o.fs.opt.Token},
-			"fileMd5ofPre10m": {fmt.Sprintf("%x", md5.Sum(first10mBytes))},
-			"fileSize":        {itoa64(size)},
-			"pid":             {dirID},
-			"diyName":         {leaf},
+			"token":      {o.fs.opt.Token},
+			"vgroupType": {"md5_10m"},
+			"vgroup":     {fmt.Sprintf("%x_%d", md5.Sum(first10mBytes), size)},
+			"pid":        {dirID},
+			"diyName":    {leaf},
+			"filename":   {leaf},
 		},
 	}
 
@@ -702,7 +728,7 @@ func (o *Object) Remove(ctx context.Context) error {
 	opts := &rest.Opts{
 		Method:  "GET",
 		RootURL: linkboxAPIURL,
-		Path:    "file_del",
+		Path:    "file/delete",
 		Parameters: url.Values{
 			"token":   {o.fs.opt.Token},
 			"itemIds": {o.itemID},
@@ -822,7 +848,12 @@ type responser interface {
 }
 
 type getUploadURLData struct {
-	SignURL string `json:"signUrl"`
+	Server          string `json:"server"`
+	AccessKey       string `json:"ak"`
+	SecretAccessKey string `json:"sk"`
+	SecurityToken   string `json:"sToken"`
+	Bucket          string `json:"bucket"`
+	PoolPath        string `json:"poolPath"`
 }
 
 type getUploadURLResponse struct {
@@ -888,10 +919,44 @@ func (f *Fs) DirCacheFlush() {
 	f.dirCache.ResetRoot()
 }
 
+// Returned from "user/info"
+type userInfoRes struct {
+	response
+	Data struct {
+		SizeCap  int64 `json:"size_cap"`
+		SizeCurr int64 `json:"size_curr"`
+	} `json:"data"`
+}
+
+// About gets quota information
+func (f *Fs) About(ctx context.Context) (usage *fs.Usage, err error) {
+	opts := &rest.Opts{
+		Method:  "GET",
+		RootURL: linkboxAPIURL,
+		Path:    "user/info",
+		Parameters: url.Values{
+			"token": {f.opt.Token},
+		},
+	}
+
+	response := userInfoRes{}
+	err = getUnmarshaledResponse(ctx, f, opts, &response)
+	if err != nil {
+		return nil, err
+	}
+	usage = &fs.Usage{
+		Total: fs.NewUsageValue(response.Data.SizeCap),                          // quota of bytes that can be used
+		Used:  fs.NewUsageValue(response.Data.SizeCurr),                         // bytes in use
+		Free:  fs.NewUsageValue(response.Data.SizeCap - response.Data.SizeCurr), // bytes which can be uploaded before reaching the quota
+	}
+	return usage, nil
+}
+
 // Check the interfaces are satisfied
 var (
 	_ fs.Fs              = &Fs{}
 	_ fs.Purger          = &Fs{}
 	_ fs.DirCacheFlusher = &Fs{}
+	_ fs.Abouter         = (*Fs)(nil)
 	_ fs.Object          = &Object{}
 )
