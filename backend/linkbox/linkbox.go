@@ -1002,6 +1002,11 @@ func (f *Fs) shouldRetry(ctx context.Context, resp *http.Response, err error) (b
 	if fserrors.ContextError(ctx, &err) {
 		return false, err
 	}
+	if obsErr, ok := err.(*obs.ObsError); ok {
+		if strings.TrimSpace(obsErr.Status) == "524" {
+			return true, err
+		}
+	}
 	return fserrors.ShouldRetry(err) || fserrors.ShouldRetryHTTP(resp, retryErrorCodes), err
 }
 
