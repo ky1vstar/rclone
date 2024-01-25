@@ -18,6 +18,7 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"os"
 	"path"
 	"regexp"
 	"strconv"
@@ -31,6 +32,7 @@ import (
 	"github.com/rclone/rclone/fs/fserrors"
 	"github.com/rclone/rclone/fs/fshttp"
 	"github.com/rclone/rclone/fs/hash"
+	"github.com/rclone/rclone/lib/atexit"
 	"github.com/rclone/rclone/lib/dircache"
 	"github.com/rclone/rclone/lib/pacer"
 	"github.com/rclone/rclone/lib/rest"
@@ -616,7 +618,8 @@ func (o *Object) Update(ctx context.Context, in io.Reader, src fs.ObjectInfo, op
 
 	switch getFirstStepResult.Status {
 	case 1:
-		obsClient, err := obs.New(
+		var obsClient *obs.ObsClient
+		obsClient, err = obs.New(
 			getFirstStepResult.Data.AccessKey,
 			getFirstStepResult.Data.SecretAccessKey,
 			getFirstStepResult.Data.Server,
@@ -633,34 +636,91 @@ func (o *Object) Update(ctx context.Context, in io.Reader, src fs.ObjectInfo, op
 		inputInit := &obs.InitiateMultipartUploadInput{}
 		inputInit.Bucket = getFirstStepResult.Data.Bucket
 		inputInit.Key = getFirstStepResult.Data.PoolPath
-		outputInit, err := obsClient.InitiateMultipartUpload(inputInit)
+		var outputInit *obs.InitiateMultipartUploadOutput
+		err = o.fs.pacer.Call(func() (bool, error) {
+			var err error
+			outputInit, err = obsClient.InitiateMultipartUpload(inputInit)
+			return o.fs.shouldRetry(ctx, nil, err)
+		})
+
 		if err != nil {
 			return fmt.Errorf("Failed to initiate a multipart upload: %w", err)
 		}
+
+		defer atexit.OnError(&err, func() {
+			// Try to abort the upload, but ignore the error.
+			fs.Debugf(o, "Cancelling multipart upload")
+			_ = o.fs.pacer.Call(func() (bool, error) {
+				_, err := obsClient.AbortMultipartUpload(&obs.AbortMultipartUploadInput{
+					Bucket:   getFirstStepResult.Data.Bucket,
+					Key:      getFirstStepResult.Data.PoolPath,
+					UploadId: outputInit.UploadId,
+				})
+				return o.fs.shouldRetry(ctx, nil, err)
+			})
+		})()
 
 		// Upload parts
 		const partSize = 52_428_800
 		numberOfParts := int(1 + (size-1)/partSize)
 		parts := make([]obs.Part, numberOfParts)
 		remainingSize := size
+
+		fs.Debugf(o, "Starting multipart upload with %d parts", numberOfParts)
+
 		for partNumber := 1; partNumber <= numberOfParts; partNumber++ {
-			fs.Debugf(o, "Uploading part %d/%d", partNumber, numberOfParts)
-			inputUploadPart := &obs.UploadPartInput{}
-			inputUploadPart.Bucket = getFirstStepResult.Data.Bucket
-			inputUploadPart.Key = getFirstStepResult.Data.PoolPath
-			inputUploadPart.UploadId = outputInit.UploadId
-			inputUploadPart.PartNumber = partNumber
-			inputUploadPart.Body = io.LimitReader(file, partSize)
-			inputUploadPart.PartSize = min(remainingSize, partSize)
-			var outputUploadPart, err = obsClient.UploadPart(inputUploadPart)
+			fs.Debugf(o, "Starting to upload part %d/%d", partNumber, numberOfParts)
+
+			var tempFile *os.File
+			tempFile, err = os.CreateTemp("", "rclone-linkb-")
+			body := io.TeeReader(io.LimitReader(file, partSize), tempFile)
+
+			err = o.fs.pacer.Call(func() (bool, error) {
+				fs.Debugf(o, "Uploading part %d/%d", partNumber, numberOfParts)
+
+				_, err := tempFile.Seek(0, io.SeekStart)
+				if err != nil {
+					return o.fs.shouldRetry(ctx, nil, err)
+				}
+
+				inputUploadPart := &obs.UploadPartInput{}
+				inputUploadPart.Bucket = getFirstStepResult.Data.Bucket
+				inputUploadPart.Key = getFirstStepResult.Data.PoolPath
+				inputUploadPart.UploadId = outputInit.UploadId
+				inputUploadPart.PartNumber = partNumber
+				inputUploadPart.Body = body
+				inputUploadPart.PartSize = min(remainingSize, partSize)
+				outputUploadPart, err := obsClient.UploadPart(inputUploadPart)
+
+				if err != nil {
+					if body != tempFile {
+						fs.Debugf(o, "Switching to cache file for part upload %d/%d", partNumber, numberOfParts)
+						_, err := io.ReadAll(body)
+						if err != nil {
+							return false, fmt.Errorf("Failed to read all from input: %w", err)
+						}
+						body = tempFile
+					}
+
+					return o.fs.shouldRetry(ctx, nil, err)
+				}
+
+				parts[partNumber-1] = obs.Part{
+					PartNumber: outputUploadPart.PartNumber,
+					ETag:       outputUploadPart.ETag,
+				}
+				remainingSize -= partSize
+				return false, nil
+			})
+
+			// these errors should be relatively uncritical and the upload should've succeeded so it's okay-ish
+			// to ignore them
+			_ = tempFile.Close()
+			_ = os.Remove(tempFile.Name())
+
 			if err != nil {
-				return fmt.Errorf("Failed to upload a part: %w", err)
+				return fmt.Errorf("Failed to upload part %d/%d: %w", partNumber, numberOfParts, err)
 			}
-			parts[partNumber-1] = obs.Part{
-				PartNumber: outputUploadPart.PartNumber,
-				ETag:       outputUploadPart.ETag,
-			}
-			remainingSize -= partSize
 		}
 
 		// Assemble parts
@@ -669,7 +729,10 @@ func (o *Object) Update(ctx context.Context, in io.Reader, src fs.ObjectInfo, op
 		inputCompleteMultipart.Key = getFirstStepResult.Data.PoolPath
 		inputCompleteMultipart.UploadId = outputInit.UploadId
 		inputCompleteMultipart.Parts = parts
-		_, err = obsClient.CompleteMultipartUpload(inputCompleteMultipart)
+		err = o.fs.pacer.Call(func() (bool, error) {
+			_, err := obsClient.CompleteMultipartUpload(inputCompleteMultipart)
+			return o.fs.shouldRetry(ctx, nil, err)
+		})
 		if err != nil {
 			return fmt.Errorf("Failed to complete a multipart upload: %w", err)
 		}
