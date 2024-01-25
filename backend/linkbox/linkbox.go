@@ -673,6 +673,17 @@ func (o *Object) Update(ctx context.Context, in io.Reader, src fs.ObjectInfo, op
 
 			var tempFile *os.File
 			tempFile, err = os.CreateTemp("", "rclone-linkb-")
+			if err != nil {
+				return fmt.Errorf("Failed to create temp file: %w", err)
+			}
+			cleanup := func() {
+				// these errors should be relatively uncritical and the upload should've succeeded so it's okay-ish
+				// to ignore them
+				_ = tempFile.Close()
+				_ = os.Remove(tempFile.Name())
+			}
+			defer cleanup()
+
 			body := io.TeeReader(io.LimitReader(file, partSize), tempFile)
 
 			err = o.fs.pacer.Call(func() (bool, error) {
@@ -713,10 +724,7 @@ func (o *Object) Update(ctx context.Context, in io.Reader, src fs.ObjectInfo, op
 				return false, nil
 			})
 
-			// these errors should be relatively uncritical and the upload should've succeeded so it's okay-ish
-			// to ignore them
-			_ = tempFile.Close()
-			_ = os.Remove(tempFile.Name())
+			cleanup()
 
 			if err != nil {
 				return fmt.Errorf("Failed to upload part %d/%d: %w", partNumber, numberOfParts, err)
