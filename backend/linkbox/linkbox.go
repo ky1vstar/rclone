@@ -997,18 +997,22 @@ var retryErrorCodes = []int{
 	509, // Bandwidth Limit Exceeded
 }
 
+var obsRetryErrorCodes = []string{
+	"502",
+	"524",
+}
+
 // shouldRetry determines whether a given err rates being retried
 func (f *Fs) shouldRetry(ctx context.Context, resp *http.Response, err error) (bool, error) {
-	if err != nil {
-		fs.Debugf(f, "Should retry error of type %T: %s.", err, err.Error())
-	}
 	if fserrors.ContextError(ctx, &err) {
 		return false, err
 	}
 	if obsErr, ok := err.(obs.ObsError); ok {
-		fs.Debugf(f, "Got OBS error with status: %s.", strings.TrimSpace(obsErr.Status))
-		if strings.TrimSpace(obsErr.Status) == "524" {
-			return true, err
+		fs.Debugf(f, "Got OBS error with status: %s.", obsErr.Status)
+		for _, e := range obsRetryErrorCodes {
+			if strings.HasPrefix(obsErr.Status, e) {
+				return true, err
+			}
 		}
 	}
 	return fserrors.ShouldRetry(err) || fserrors.ShouldRetryHTTP(resp, retryErrorCodes), err
