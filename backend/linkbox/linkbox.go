@@ -999,7 +999,9 @@ var retryErrorCodes = []int{
 
 // shouldRetry determines whether a given err rates being retried
 func (f *Fs) shouldRetry(ctx context.Context, resp *http.Response, err error) (bool, error) {
-	fs.Debugf(f, "Should retry error of type %T: %s.", err, err.Error())
+	if err != nil {
+		fs.Debugf(f, "Should retry error of type %T: %s.", err, err.Error())
+	}
 	if fserrors.ContextError(ctx, &err) {
 		return false, err
 	}
