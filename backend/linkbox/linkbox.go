@@ -1003,6 +1003,7 @@ func (f *Fs) shouldRetry(ctx context.Context, resp *http.Response, err error) (b
 		return false, err
 	}
 	if obsErr, ok := err.(*obs.ObsError); ok {
+		fs.Debugf(ctx, "Got OBS error with status: %s.", strings.TrimSpace(obsErr.Status))
 		if strings.TrimSpace(obsErr.Status) == "524" {
 			return true, err
 		}
