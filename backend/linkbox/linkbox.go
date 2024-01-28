@@ -998,7 +998,9 @@ var retryErrorCodes = []int{
 }
 
 var obsRetryErrorCodes = []string{
+	"408",
 	"502",
+	"520",
 	"524",
 }
 
