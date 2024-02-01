@@ -640,7 +640,9 @@ func (o *Object) Update(ctx context.Context, in io.Reader, src fs.ObjectInfo, op
 		if err != nil {
 			return fmt.Errorf("Failed to create OBS client: %w", err)
 		}
-		defer obsClient.Close()
+		defer func() {
+			obsClient.Close()
+		}()
 
 		file := io.MultiReader(bytes.NewReader(first10mBytes), in)
 
