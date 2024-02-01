@@ -595,21 +595,26 @@ func (o *Object) Update(ctx context.Context, in io.Reader, src fs.ObjectInfo, op
 	}
 
 	// get upload authorization (step 1)
-	opts := &rest.Opts{
-		Method:  "GET",
-		RootURL: linkboxAPIURL,
-		Path:    "file/get_file_upload_session",
-		Options: options,
-		Parameters: url.Values{
-			"token":      {o.fs.opt.Token},
-			"scene":      {"common"},
-			"vgroupType": {"md5_10m"},
-			"vgroup":     {fmt.Sprintf("%x_%d", md5.Sum(first10mBytes), size)},
-		},
-	}
+	var getFirstStepResult getUploadURLResponse
+	authorizeUpload := func() error {
+		opts := &rest.Opts{
+			Method:  "GET",
+			RootURL: linkboxAPIURL,
+			Path:    "file/get_file_upload_session",
+			Options: options,
+			Parameters: url.Values{
+				"token":      {o.fs.opt.Token},
+				"scene":      {"common"},
+				"vgroupType": {"md5_10m"},
+				"vgroup":     {fmt.Sprintf("%x_%d", md5.Sum(first10mBytes), size)},
+			},
+		}
 
-	getFirstStepResult := getUploadURLResponse{}
-	err = getUnmarshaledResponse(ctx, o.fs, opts, &getFirstStepResult)
+		getFirstStepResult = getUploadURLResponse{}
+		err = getUnmarshaledResponse(ctx, o.fs, opts, &getFirstStepResult)
+		return err
+	}
+	err = authorizeUpload()
 	if err != nil {
 		if getFirstStepResult.Status != 600 {
 			return fmt.Errorf("Update err in unmarshaling response: %w", err)
@@ -619,12 +624,19 @@ func (o *Object) Update(ctx context.Context, in io.Reader, src fs.ObjectInfo, op
 	switch getFirstStepResult.Status {
 	case 1:
 		var obsClient *obs.ObsClient
-		obsClient, err = obs.New(
-			getFirstStepResult.Data.AccessKey,
-			getFirstStepResult.Data.SecretAccessKey,
-			getFirstStepResult.Data.Server,
-			obs.WithSecurityToken(getFirstStepResult.Data.SecurityToken),
-		)
+		newObsClient := func() error {
+			if obsClient != nil {
+				obsClient.Close()
+			}
+			obsClient, err = obs.New(
+				getFirstStepResult.Data.AccessKey,
+				getFirstStepResult.Data.SecretAccessKey,
+				getFirstStepResult.Data.Server,
+				obs.WithSecurityToken(getFirstStepResult.Data.SecurityToken),
+			)
+			return err
+		}
+		newObsClient()
 		if err != nil {
 			return fmt.Errorf("Failed to create OBS client: %w", err)
 		}
@@ -713,6 +725,19 @@ func (o *Object) Update(ctx context.Context, in io.Reader, src fs.ObjectInfo, op
 						body = tempFile
 					}
 
+					if obsErr, ok := err.(obs.ObsError); ok && strings.HasPrefix(obsErr.Status, "403") {
+						fs.Debugf(o, "Got unauthorized error while uploading a part %d/%d. Re-authorizing an upload", partNumber, numberOfParts)
+						err = authorizeUpload()
+						if err != nil {
+							return false, err
+						}
+						err = newObsClient()
+						if err != nil {
+							return false, err
+						}
+						return true, obsErr
+					}
+
 					return o.fs.shouldRetry(ctx, nil, err)
 				}
 
@@ -758,7 +783,7 @@ func (o *Object) Update(ctx context.Context, in io.Reader, src fs.ObjectInfo, op
 	}
 
 	// create file item at Linkbox (second step)
-	opts = &rest.Opts{
+	opts := &rest.Opts{
 		Method:  "GET",
 		RootURL: linkboxAPIURL,
 		Path:    "file/create_item",
